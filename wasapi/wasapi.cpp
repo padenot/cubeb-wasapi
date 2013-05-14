@@ -43,6 +43,7 @@ struct cubeb_stream
   HANDLE shutdown_event;
   HANDLE refill_event;
   HANDLE thread;
+  /* Maximum number of frames we can be requested in a callback. */
   uint32_t buffer_frame_count;
   /* Mixer pameters. We need to convert the input 
    * stream to this samplerate/channel layout. */
@@ -101,6 +102,18 @@ static size_t
 frame_to_bytes(cubeb_stream * stm, size_t frames)
 {
   return stm->bytes_per_frame * frames;
+}
+
+static void
+refill_with_resampling(cubeb_stream * stm, float * data, long needed)
+{
+
+}
+
+static void
+refill(cubeb_stream * stm, float * data, long needed)
+{
+
 }
 
 static DWORD __stdcall
@@ -165,12 +178,14 @@ wasapi_stream_render_loop(LPVOID stream)
           * resampling buffer, otherwise, directly in the AudioClient buffer */
           long got;
           if (stm->resampler) {
-            size_t leftover_bytes = frame_to_bytes(stm, stm->leftover_frame_count);
-            memcpy(stm->resampling_src_buffer, stm->leftover_frames, leftover_bytes);
-            // fuck, pointer arithmetics.
-            uint8_t * buffer_start = reinterpret_cast<uint8_t*>(stm->resampling_src_buffer) + leftover_bytes;
             long needed = before_resampling - stm->leftover_frame_count;
+            size_t leftover_bytes = frame_to_bytes(stm, stm->leftover_frame_count);
+
+            memcpy(stm->resampling_src_buffer, stm->leftover_frames, leftover_bytes);
+            uint8_t * buffer_start = reinterpret_cast<uint8_t*>(stm->resampling_src_buffer) + leftover_bytes;
+
             got = stm->data_callback(stm, stm->user_ptr, buffer_start, needed);
+
             if (got != needed) {
               LOG("draining.");
               stm->draining = true;
@@ -188,17 +203,20 @@ wasapi_stream_render_loop(LPVOID stream)
             uint32_t in_frames = in_frames_bck = before_resampling;
             uint32_t out_frames = out_frames_bck = available;
 
-            speex_resampler_process_interleaved_float(stm->resampler, stm->resampling_src_buffer, &in_frames, data_f, &out_frames);
+            speex_resampler_process_interleaved_float(stm->resampler,
+                                                      stm->resampling_src_buffer,
+                                                      &in_frames, data_f, &out_frames);
             
-            size_t unresampled_bytes = frame_to_bytes(stm, in_frames_bck - in_frames);
-            float * unresampled_start = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(stm->resampling_src_buffer) + frame_to_bytes(stm, in_frames));
+            stm->leftover_frame_count = in_frames_bck - in_frames;
+            size_t unresampled_bytes = frame_to_bytes(stm, stm->leftover_frame_count);
+
+            uint8_t * leftover_frames_start = reinterpret_cast<uint8_t*>(stm->resampling_src_buffer);
+            leftover_frames_start += frame_to_bytes(stm, in_frames);
+
             assert(stm->leftover_frame_count <= stm->leftover_frame_size);
-            memcpy(stm->leftover_frames, unresampled_start, unresampled_bytes);
-            stm->leftover_frame_count = (in_frames_bck - in_frames);
-           // LOG("saving %u frames, leftover from resampling", stm->leftover_frame_count);
-            if (out_frames != out_frames_bck) {
-              LOG("did not output expected number of frames: %u -> %u", out_frames_bck, out_frames);
-            }
+            memcpy(stm->leftover_frames, leftover_frames_start, unresampled_bytes);
+
+            assert(out_frames == out_frames_bck);
           }
 
           if (stm->need_upmix) {
