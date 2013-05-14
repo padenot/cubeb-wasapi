@@ -62,13 +62,18 @@ struct cubeb_stream
   uint32_t leftover_frame_count;
   uint32_t leftover_frame_size;
   float * leftover_frames;
+  /* upmix buffer of size |buffer_frame_count * bytes_per_frame / 2|.
+   * if this is !NULL, mono -> stereo upmixing is needed */
+  float* upmix_buffer;
   uint8_t bytes_per_frame;
   bool draining;
-  bool need_upmix;
 };
 
-/* in theory, windows in shared mode always support float32, so this is unused */
-void convert_float32_to_integer16(float* in, long samples, short* out)
+/* WASAPI in shared mode always support float32, so this is unused.
+ * If we decide to use exclusive mode some day, we will need those two 
+ * functions. */
+void 
+convert_float32_to_integer16(float* in, long samples, short* out)
 {
   for (int i = 0; i < samples; i++) {
     float v = in[i] * 32768.0f;
@@ -76,7 +81,8 @@ void convert_float32_to_integer16(float* in, long samples, short* out)
   }
 }
 
-void convert_integer16_to_float32(short * in, long samples, float * out)
+void 
+convert_integer16_to_float32(short * in, long samples, float * out)
 {
   for (int i = 0; i < samples; i++) {
     out[i] = in[i] / 32768.0f;
@@ -85,45 +91,41 @@ void convert_integer16_to_float32(short * in, long samples, float * out)
 
 /* |out| has to be twice as long as |in| */
 template<typename T>
-void mono_to_stereo(T * in, long insamples, T * out)
+void
+mono_to_stereo(T * in, long insamples, T * out)
 {
-  int j = 0;
-  for (int i = 0; i < insamples; i++, j+=2) {
-    out[j] = out[j+1] = out[i];
+  for (int i = 0; i < insamples; i++) {
+    out[i * 2] = out[i * 2 + 1] = in[i];
   }
 }
 
-template<typename T>
-void stereo_to_mono(T * in, long insamples, T * out)
-{
-  for (int i = 0, int j = 0; i < insamples; i+=2, j++) {
-    out[j] = in[i] + in[i+1];
-  }
-}
-
+/* This returns the size of a frame in the stream. */
 static size_t
-frame_to_bytes(cubeb_stream * stm, size_t frames)
+frame_to_bytes_before_upmix(cubeb_stream * stm, size_t frames)
 {
+  if (stm->upmix_buffer) {
+    return stm->bytes_per_frame / 2 * frames;
+  }
   return stm->bytes_per_frame * frames;
 }
 
 void
 refill_with_resampling(cubeb_stream * stm, float * data, long needed)
 {
-  if (stm->need_upmix) {
-    needed /= 2;
-  }
-  /* Round up the input frame count, so in the worst case,
-  * we have a leftover unresampled frames at the end, that we can use
-  * during the next iteration.*/
-  float rate = static_cast<float>(stm->stream_params.rate) / stm->mix_params.rate;
   long got;
+
+  /* Round up the input frame count, so in the worst case,
+   * we have leftover unresampled frames at the end, that we can use
+   * during the next iteration.*/
+  float rate = static_cast<float>(stm->stream_params.rate) / stm->mix_params.rate;
 
   long before_resampling = static_cast<long>(ceilf(rate * needed) + 1);
 
   long frame_request = before_resampling - stm->leftover_frame_count;
-  size_t leftover_bytes = frame_to_bytes(stm, stm->leftover_frame_count);
 
+  size_t leftover_bytes = frame_to_bytes_before_upmix(stm, stm->leftover_frame_count);
+
+  /* copy the previous leftover frames to the front of the buffer */
   memcpy(stm->resampling_src_buffer, stm->leftover_frames, leftover_bytes);
   uint8_t * buffer_start = reinterpret_cast<uint8_t*>(stm->resampling_src_buffer) + leftover_bytes;
 
@@ -138,15 +140,25 @@ refill_with_resampling(cubeb_stream * stm, float * data, long needed)
   uint32_t in_frames = in_frames_bck = before_resampling;
   uint32_t out_frames = out_frames_bck = needed;
 
+  /* if we need to upmix after resampling, resample into
+   * the upmix buffer to avoid a copy */
+  float * resample_dest;
+  if (stm->upmix_buffer) {
+    resample_dest = stm->upmix_buffer;
+  } else {
+    resample_dest = data;
+  }
+
   speex_resampler_process_interleaved_float(stm->resampler,
                                             stm->resampling_src_buffer,
-                                            &in_frames, data, &out_frames);
+                                            &in_frames, resample_dest, &out_frames);
 
+  /* copy the leftover frames to buffer for the next time */
   stm->leftover_frame_count = in_frames_bck - in_frames;
-  size_t unresampled_bytes = frame_to_bytes(stm, stm->leftover_frame_count);
+  size_t unresampled_bytes = frame_to_bytes_before_upmix(stm, stm->leftover_frame_count);
 
   uint8_t * leftover_frames_start = reinterpret_cast<uint8_t*>(stm->resampling_src_buffer);
-  leftover_frames_start += frame_to_bytes(stm, in_frames);
+  leftover_frames_start += frame_to_bytes_before_upmix(stm, in_frames);
 
   assert(stm->leftover_frame_count <= stm->leftover_frame_size);
   memcpy(stm->leftover_frames, leftover_frames_start, unresampled_bytes);
@@ -154,33 +166,32 @@ refill_with_resampling(cubeb_stream * stm, float * data, long needed)
   /* if this is not true, there will be glitches */
   assert(out_frames == out_frames_bck);
 
-  if (stm->need_upmix) {
-    mono_to_stereo(stm->resampling_src_buffer, needed, data);
+  if (stm->upmix_buffer) {
+    mono_to_stereo(resample_dest, out_frames, data);
   }
 }
 
 void
 refill(cubeb_stream * stm, float * data, long needed)
 {
-  if (stm->need_upmix) {
-    needed /= 2;
+  /* if we need to upmix after resampling, get the data into
+   * the upmix buffer to avoid a copy */
+  float * dest;
+  if (stm->upmix_buffer) {
+    dest = stm->upmix_buffer;
+  } else {
+    dest = data;
   }
 
-  long got = stm->data_callback(stm, stm->user_ptr, data, needed);
+  long got = stm->data_callback(stm, stm->user_ptr, dest, needed);
   
   if (got != needed) {
     LOG("draining.");
     stm->draining = true;
   }
   
-  if (stm->need_upmix) {
-    /* get a little buffer to upmix to. */
-    /* XXX we should be able to use the resampler buffer here if the output rate 
-    * is at least half the size of the input rate. */
-    float* tmp = (float*)malloc(needed * 2 * sizeof(float));
-    mono_to_stereo(data, needed, tmp);
-    memcpy(data, tmp, needed * 2 * sizeof(float));
-    free(tmp);
+  if (stm->upmix_buffer) {
+    mono_to_stereo(dest, needed, data);
   }
 }
 
@@ -330,7 +341,6 @@ int wasapi_stream_init(cubeb * context, cubeb_stream ** stream, char const * str
   (*stream)->user_ptr = user_ptr;
   (*stream)->stream_params = stream_params;
   (*stream)->draining = false;
-  (*stream)->need_upmix = false;
   (*stream)->leftover_frames = NULL;
 
   (*stream)->shutdown_event = CreateEventEx(NULL, NULL, 0, EVENT_MODIFY_STATE | SYNCHRONIZE);
@@ -363,6 +373,8 @@ int wasapi_stream_init(cubeb * context, cubeb_stream ** stream, char const * str
   /* We have to dinstinguish between the format the mixer uses, 
   * and the format the stream we want to play uses. */
   (*stream)->client->GetMixFormat(&mix_format);
+
+  /* this is the number of bytes per frame after the eventual upmix. */
   (*stream)->bytes_per_frame = static_cast<uint8_t>(mix_format->nBlockAlign);
   if (mix_format->wFormatTag == WAVE_FORMAT_PCM ||
     mix_format->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
@@ -386,13 +398,6 @@ int wasapi_stream_init(cubeb * context, cubeb_stream ** stream, char const * str
 
   float resampling_rate = static_cast<float>((*stream)->stream_params.rate) / (*stream)->mix_params.rate;
 
-  /* If we are playing a mono stream, we need to upmix to stereo.
-   * For now, we assume that the output support stereo sound.
-   * The alternative would be sad */
-  assert(mix_format->nChannels == 2);
-
-  (*stream)->need_upmix = mix_format->nChannels != (*stream)->stream_params.channels;
-
   if (resampling_rate != 1.0) {
     /* If we are playing a mono stream, we only resample one channel,
      * and copy it over, so we are always resampling the number
@@ -402,15 +407,17 @@ int wasapi_stream_init(cubeb * context, cubeb_stream ** stream, char const * str
                                                 (*stream)->mix_params.rate,
                                                 SPEEX_RESAMPLER_QUALITY_DESKTOP,
                                                 NULL);
+    if (!(*stream)->resampler) {
+      wasapi_stream_destroy(*stream);
+      CoTaskMemFree(mix_format);
+      return CUBEB_ERROR;
+    }
+
     /* Get a little buffer so we can store the leftover frames,
      * i.e. the samples not consumed by the resampler that we will end up
      * using next time the render callback is called. */
     (*stream)->leftover_frame_size = static_cast<uint32_t>(ceilf(1 / resampling_rate * 2));
-    (*stream)->leftover_frames = (float*)malloc(frame_to_bytes(*stream, (*stream)->leftover_frame_size));
-    if (!(*stream)->resampler) {
-      wasapi_stream_destroy(*stream);
-      return CUBEB_ERROR;
-    }
+    (*stream)->leftover_frames = (float*)malloc(frame_to_bytes_before_upmix(*stream, (*stream)->leftover_frame_size));
 
     (*stream)->refill_function = &refill_with_resampling;
   } else {
@@ -423,10 +430,12 @@ int wasapi_stream_init(cubeb * context, cubeb_stream ** stream, char const * str
 
   hr = (*stream)->client->Initialize(AUDCLNT_SHAREMODE_SHARED, 
                                      AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST, 
-                                     latency*HNS_PER_MS, 
+                                     latency * HNS_PER_MS, 
                                      0, 
                                      mix_format, 
                                      NULL);
+
+  CoTaskMemFree(mix_format);
 
   if (FAILED(hr)) {
     LOG("Unable to initialize audio client: %x.", hr);
@@ -442,6 +451,15 @@ int wasapi_stream_init(cubeb * context, cubeb_stream ** stream, char const * str
     return CUBEB_ERROR;
   }
 
+  /* If we are playing a mono stream, we need to upmix to stereo.
+   * For now, we assume that the output support stereo sound.
+   * The alternative would be sad */
+  assert((*stream)->mix_params.channels == 2);
+
+  if ((*stream)->mix_params.channels != (*stream)->stream_params.channels) {
+    (*stream)->upmix_buffer = (float*) malloc(frame_to_bytes_before_upmix((*stream), (*stream)->buffer_frame_count));
+  }
+
   /* If we are going to resample, we will end up needing a buffer
    * to resample from, because speex's resampler does not do
    * in-place processing. Of course we need to take the resampling 
@@ -449,10 +467,7 @@ int wasapi_stream_init(cubeb * context, cubeb_stream ** stream, char const * str
   if ((*stream)->resampler) {
     size_t frames_needed = static_cast<size_t>(resampling_rate * (*stream)->buffer_frame_count);
     
-    if ((*stream)->need_upmix) {
-      frames_needed /= 2;
-    }
-    (*stream)->resampling_src_buffer = (float*)malloc(frame_to_bytes(*stream, frames_needed));
+    (*stream)->resampling_src_buffer = (float*)malloc(frame_to_bytes_before_upmix(*stream, frames_needed));
   }
 
   hr = (*stream)->client->SetEventHandle((*stream)->refill_event);
@@ -467,13 +482,17 @@ int wasapi_stream_init(cubeb * context, cubeb_stream ** stream, char const * str
 
   if (FAILED(hr)) {
     LOG("Could not get the render client.");
-    free(*stream);
+    wasapi_stream_destroy(*stream);
     return CUBEB_ERROR;
   }
 
   hr = (*stream)->client->GetService(__uuidof(IAudioClock), (void**)&(*stream)->audio_clock);
 
-  CoTaskMemFree(mix_format);
+  if (FAILED(hr)) {
+    LOG("Could not get the IAudioClock.");
+    wasapi_stream_destroy(*stream);
+    return CUBEB_ERROR;
+  }
 
   return CUBEB_OK;
 }
@@ -505,7 +524,13 @@ void wasapi_stream_destroy(cubeb_stream * stm)
     free(stm->resampling_src_buffer);
   }
 
+  if (stm->upmix_buffer) {
+    free(stm->upmix_buffer);
+  }
+
   free(stm);
+
+  CoUninitialize();
 }
 
 int wasapi_stream_start(cubeb_stream * stm)
@@ -675,9 +700,9 @@ int main(int argc, char* argv[])
   wasapi_init(&ctx, "context_name");
   LOG("meh.");
   cubeb_stream_params params;
-  params.channels = 2;
+  params.channels = 1;
   params.format = CUBEB_SAMPLE_FLOAT32NE;
-  params.rate = 8000;
+  params.rate = 44100;
   if (wasapi_stream_init(ctx, &stream, "meh", params, 30, data_callback, state_callback, NULL) != CUBEB_OK) {
     LOG("KO");
   } else {
