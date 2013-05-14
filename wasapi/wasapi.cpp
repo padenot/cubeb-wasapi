@@ -35,6 +35,8 @@ struct cubeb
   IMMDevice* device;
 };
 
+typedef void (*refill_function)(cubeb_stream * stm, float * data, long frame_needed);
+
 struct cubeb_stream
 {
   IAudioClient * client;
@@ -55,6 +57,7 @@ struct cubeb_stream
   /* Resampler instance. If this is !NULL, resampling should happen. */
   SpeexResamplerState * resampler;
   float * resampling_src_buffer;
+  refill_function refill_function;
   /* Leftover frames handling. */
   uint32_t leftover_frame_count;
   uint32_t leftover_frame_size;
@@ -104,16 +107,81 @@ frame_to_bytes(cubeb_stream * stm, size_t frames)
   return stm->bytes_per_frame * frames;
 }
 
-static void
+void
 refill_with_resampling(cubeb_stream * stm, float * data, long needed)
 {
+  if (stm->need_upmix) {
+    needed /= 2;
+  }
+  /* Round up the input frame count, so in the worst case,
+  * we have a leftover unresampled frames at the end, that we can use
+  * during the next iteration.*/
+  float rate = static_cast<float>(stm->stream_params.rate) / stm->mix_params.rate;
+  long got;
 
+  long before_resampling = static_cast<long>(ceilf(rate * needed) + 1);
+
+  long frame_request = before_resampling - stm->leftover_frame_count;
+  size_t leftover_bytes = frame_to_bytes(stm, stm->leftover_frame_count);
+
+  memcpy(stm->resampling_src_buffer, stm->leftover_frames, leftover_bytes);
+  uint8_t * buffer_start = reinterpret_cast<uint8_t*>(stm->resampling_src_buffer) + leftover_bytes;
+
+  got = stm->data_callback(stm, stm->user_ptr, buffer_start, frame_request);
+
+  if (got != frame_request) {
+    LOG("draining.");
+    stm->draining = true;
+  }
+
+  uint32_t in_frames_bck, out_frames_bck;
+  uint32_t in_frames = in_frames_bck = before_resampling;
+  uint32_t out_frames = out_frames_bck = needed;
+
+  speex_resampler_process_interleaved_float(stm->resampler,
+                                            stm->resampling_src_buffer,
+                                            &in_frames, data, &out_frames);
+
+  stm->leftover_frame_count = in_frames_bck - in_frames;
+  size_t unresampled_bytes = frame_to_bytes(stm, stm->leftover_frame_count);
+
+  uint8_t * leftover_frames_start = reinterpret_cast<uint8_t*>(stm->resampling_src_buffer);
+  leftover_frames_start += frame_to_bytes(stm, in_frames);
+
+  assert(stm->leftover_frame_count <= stm->leftover_frame_size);
+  memcpy(stm->leftover_frames, leftover_frames_start, unresampled_bytes);
+
+  /* if this is not true, there will be glitches */
+  assert(out_frames == out_frames_bck);
+
+  if (stm->need_upmix) {
+    mono_to_stereo(stm->resampling_src_buffer, needed, data);
+  }
 }
 
-static void
+void
 refill(cubeb_stream * stm, float * data, long needed)
 {
+  if (stm->need_upmix) {
+    needed /= 2;
+  }
 
+  long got = stm->data_callback(stm, stm->user_ptr, data, needed);
+  
+  if (got != needed) {
+    LOG("draining.");
+    stm->draining = true;
+  }
+  
+  if (stm->need_upmix) {
+    /* get a little buffer to upmix to. */
+    /* XXX we should be able to use the resampler buffer here if the output rate 
+    * is at least half the size of the input rate. */
+    float* tmp = (float*)malloc(needed * 2 * sizeof(float));
+    mono_to_stereo(data, needed, tmp);
+    memcpy(data, tmp, needed * 2 * sizeof(float));
+    free(tmp);
+  }
 }
 
 static DWORD __stdcall
@@ -145,7 +213,6 @@ wasapi_stream_render_loop(LPVOID stream)
       BYTE* data;
       UINT32 padding;
       long available;
-      long before_resampling;
 
       hr = stm->client->GetCurrentPadding(&padding);
       if (stm->draining) {
@@ -160,80 +227,9 @@ wasapi_stream_render_loop(LPVOID stream)
         hr = stm->render_client->GetBuffer(available, &data);
         float* data_f = reinterpret_cast<float*>(data);
         if (SUCCEEDED(hr)) {
-          /* We need to ask the right amount of data taking the 
-           * resampling and channel layout into account. */
-          if (stm->need_upmix) {
-            available /= 2;
-          }
-          if (stm->resampler) {
-            /* Round up the input frame count, so in the worst case,
-             * we have a leftover unresampled frames at the end, that we can use
-             * during the next iteration.*/
-            float rate = static_cast<float>(stm->stream_params.rate) / stm->mix_params.rate;
 
-            before_resampling = static_cast<long>(ceilf(rate * available) + 1);
-          }
+          (*stm->refill_function)(stm, data_f, available);
 
-          /* if we are going to resample, put the data in the
-          * resampling buffer, otherwise, directly in the AudioClient buffer */
-          long got;
-          if (stm->resampler) {
-            long needed = before_resampling - stm->leftover_frame_count;
-            size_t leftover_bytes = frame_to_bytes(stm, stm->leftover_frame_count);
-
-            memcpy(stm->resampling_src_buffer, stm->leftover_frames, leftover_bytes);
-            uint8_t * buffer_start = reinterpret_cast<uint8_t*>(stm->resampling_src_buffer) + leftover_bytes;
-
-            got = stm->data_callback(stm, stm->user_ptr, buffer_start, needed);
-
-            if (got != needed) {
-              LOG("draining.");
-              stm->draining = true;
-            }
-          } else {
-            got = stm->data_callback(stm, stm->user_ptr, data, available);
-            if (got != available) {
-              LOG("draining.");
-              stm->draining = true;
-            }
-          } 
-
-          if (stm->resampler) {
-            uint32_t in_frames_bck, out_frames_bck;
-            uint32_t in_frames = in_frames_bck = before_resampling;
-            uint32_t out_frames = out_frames_bck = available;
-
-            speex_resampler_process_interleaved_float(stm->resampler,
-                                                      stm->resampling_src_buffer,
-                                                      &in_frames, data_f, &out_frames);
-            
-            stm->leftover_frame_count = in_frames_bck - in_frames;
-            size_t unresampled_bytes = frame_to_bytes(stm, stm->leftover_frame_count);
-
-            uint8_t * leftover_frames_start = reinterpret_cast<uint8_t*>(stm->resampling_src_buffer);
-            leftover_frames_start += frame_to_bytes(stm, in_frames);
-
-            assert(stm->leftover_frame_count <= stm->leftover_frame_size);
-            memcpy(stm->leftover_frames, leftover_frames_start, unresampled_bytes);
-
-            assert(out_frames == out_frames_bck);
-          }
-
-          if (stm->need_upmix) {
-            if (stm->resampler) {
-              /* get a little buffer to upmix to. */
-              /* XXX we should be able to use the resampler buffer here if the output rate 
-               * is at least half the size of the input rate. */
-              float* tmp = (float*)malloc(available * 2 * sizeof(float));
-              mono_to_stereo(data_f, available, tmp);
-              memcpy(data, tmp, available * 2 * sizeof(float));
-              free(tmp);
-            } else {
-              mono_to_stereo(stm->resampling_src_buffer, available, data_f);
-            }
-
-            available *= 2;
-          }
           hr = stm->render_client->ReleaseBuffer(available, 0);
           if (FAILED(hr)) {
             LOG("failed to release buffer.");
@@ -415,6 +411,10 @@ int wasapi_stream_init(cubeb * context, cubeb_stream ** stream, char const * str
       wasapi_stream_destroy(*stream);
       return CUBEB_ERROR;
     }
+
+    (*stream)->refill_function = &refill_with_resampling;
+  } else {
+    (*stream)->refill_function = &refill;
   }
 
   LOG("Mix format: %d", (*stream)->mix_params.format);
